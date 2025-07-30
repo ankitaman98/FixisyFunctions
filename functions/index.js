@@ -4,9 +4,19 @@ import {initializeApp} from "firebase-admin/app";
 import {getAuth} from "firebase-admin/auth";
 import {getFirestore, FieldValue} from "firebase-admin/firestore";
 import {getMessaging} from "firebase-admin/messaging";
+import apn from "apn";
 
 initializeApp();
 const db = getFirestore(); // Initialize Firestore instance
+
+/**
+ * Checks if a token is an APNs token (64 hex chars, no colons, no spaces).
+ * @param {string} token
+ * @return {boolean}
+ */
+function isApnsToken(token) {
+  return /^[a-f0-9]{64}$/i.test(token);
+}
 
 export const createStaffUser = onCall(async (request) => {
   log("DEBUG: request.auth:", request.auth);
@@ -177,18 +187,22 @@ export const sendBroadcastNotification = onCall(async (request) => {
       }
     }
 
-    if (tokens.length === 0) {
-      log("DEBUG: No FCM tokens found for customers:", businessId);
+    // Split tokens into FCM and APNs tokens
+    const fcmTokens = tokens.filter((t) => !isApnsToken(t));
+    const apnsTokens = tokens.filter(isApnsToken);
+
+    if (fcmTokens.length === 0 && apnsTokens.length === 0) {
+      log("DEBUG: No FCM or APNs tokens found for customers:", businessId);
       return {
         success: true,
-        message: "No customers found with FCM tokens",
+        message: "No customers found with FCM or APNs tokens",
         totalTokens: 0,
         totalSuccess: 0,
         totalFailure: 0,
       };
     }
 
-    // Prepare notification payload
+    // Prepare notification payload (for FCM)
     const payload = {
       notification: {
         title: title,
@@ -212,44 +226,123 @@ export const sendBroadcastNotification = onCall(async (request) => {
       },
     };
 
-    // Send notifications in batches (FCM limit is 500 tokens per request)
+    // Send FCM notifications in batches (FCM limit is 500 tokens per request)
     const batchSize = 500;
     const results = [];
+    let totalSuccess = 0;
+    let totalFailure = 0;
 
-    for (let i = 0; i < tokens.length; i += batchSize) {
-      const batch = tokens.slice(i, i + batchSize);
-
+    for (let i = 0; i < fcmTokens.length; i += batchSize) {
+      const batch = fcmTokens.slice(i, i + batchSize);
       try {
-        // Construct the multicast message with the tokens and payload
         const multicastMessage = {tokens: batch, ...payload};
-
-        // Use sendEachForMulticast for sending to multiple tokens
         const response = await getMessaging().sendEachForMulticast(
             multicastMessage,
         );
         results.push({
           batch: Math.floor(i / batchSize) + 1,
+          type: "FCM",
           successCount: response.successCount,
           failureCount: response.failureCount,
           responses: response.responses,
         });
+        totalSuccess += response.successCount;
+        totalFailure += response.failureCount;
       } catch (error) {
-        log("DEBUG: Error sending batch:", error.message);
+        log("DEBUG: Error sending FCM batch:", error.message);
         results.push({
           batch: Math.floor(i / batchSize) + 1,
+          type: "FCM",
           error: error.message,
         });
       }
     }
 
-    const totalSuccess = results.reduce(
-        (sum, result) => sum + (result.successCount || 0),
-        0,
-    );
-    const totalFailure = results.reduce(
-        (sum, result) => sum + (result.failureCount || 0),
-        0,
-    );
+    // Send APNs notifications if there are APNs tokens
+    if (apnsTokens.length > 0) {
+      log("DEBUG: Sending APNs notifications", {
+        apnsTokenCount: apnsTokens.length,
+        title,
+        message,
+        imageUrl,
+        data,
+      });
+      // APNs provider setup (replace with your credentials)
+      const apnProvider = new apn.Provider({
+        token: {
+          key: "./AuthKey_G3U784978F.p8",
+          keyId: "G3U784978F",
+          teamId: "PWZNNKGGN3",
+        },
+        production: true,
+      });
+      const apnNotification = new apn.Notification();
+      apnNotification.alert = {title, body: message};
+      apnNotification.sound = "default";
+      apnNotification.topic = "com.ankit.aman.Fixisy";
+      // if (imageUrl) {
+      //   apnNotification.mutableContent = 1;
+      //   apnNotification.aps = {"mutable-content": 1};
+      //   apnNotification.payload = {
+      //     ...(apnNotification.payload || {}),
+      //     imageUrl,
+      //   };
+      // }
+      if (data) {
+        apnNotification.payload = {
+          ...(apnNotification.payload || {}),
+          ...data,
+        };
+      }
+      // Send APNs notifications in batches (max 1000 per batch is safe)
+      for (let i = 0; i < apnsTokens.length; i += 1000) {
+        const batch = apnsTokens.slice(i, i + 1000);
+        log("DEBUG: Sending APNs batch", {
+          batchNumber: Math.floor(i / 1000) + 1,
+          batchSize: batch.length,
+          notificationPayload: apnNotification,
+        });
+        try {
+          const response = await apnProvider.send(apnNotification, batch);
+          log("DEBUG: APNs batch response", {
+            batchNumber: Math.floor(i / 1000) + 1,
+            sent: response.sent.length,
+            failed: response.failed.length,
+            failedDetails: response.failed,
+          });
+          if (response.failed && response.failed.length > 0) {
+            response.failed.forEach((fail, idx) => {
+              log("APNs failure detail", {
+                batch: Math.floor(i / 1000) + 1,
+                index: idx,
+                device: fail.device,
+                status: fail.status,
+                response: fail.response,
+                error: fail.error,
+                full: JSON.stringify(fail),
+              });
+            });
+          }
+          results.push({
+            batch: Math.floor(i / 1000) + 1,
+            type: "APNs",
+            sent: response.sent.length,
+            failed: response.failed.length,
+            details: response.failed,
+          });
+          totalSuccess += response.sent.length;
+          totalFailure += response.failed.length;
+        } catch (error) {
+          log("DEBUG: Error sending APNs batch:", error.message);
+          results.push({
+            batch: Math.floor(i / 1000) + 1,
+            type: "APNs",
+            error: error.message,
+          });
+        }
+      }
+      apnProvider.shutdown();
+    }
 
     log("DEBUG: Broadcast notification sent successfully:", {
       totalTokens: tokens.length,
@@ -260,7 +353,9 @@ export const sendBroadcastNotification = onCall(async (request) => {
 
     return {
       success: true,
-      message: `Notification sent to ${totalSuccess} devices`,
+      message:
+        `Notification sent to ${totalSuccess} devices` +
+        (apnsTokens.length > 0 ? " (includes APNs)" : ""),
       totalTokens: tokens.length,
       totalSuccess,
       totalFailure,
@@ -272,6 +367,12 @@ export const sendBroadcastNotification = onCall(async (request) => {
   }
 });
 
+/**
+ * Sends a status update notification to a user by mobile number.
+ * Supports both FCM and APNs tokens, with image and data payloads.
+ * @param {object} request
+ * @return {Promise<object>}
+ */
 export const sendStatusUpdate = onCall(async (request) => {
   log("DEBUG: sendNotificationByMobile called. request.auth:", request.auth);
   log("DEBUG: sendNotificationByMobile called. request.data:", request.data);
@@ -283,8 +384,8 @@ export const sendStatusUpdate = onCall(async (request) => {
     };
   }
 
-  const {mobile, title, message} = request.data;
-  log("DEBUG: Extracted params", {mobile, title, message});
+  const {mobile, title, message, imageUrl, data} = request.data;
+  log("DEBUG: Extracted params", {mobile, title, message, imageUrl, data});
 
   if (!mobile || !title || !message) {
     log("DEBUG: Missing required fields", {mobile, title, message});
@@ -330,21 +431,26 @@ export const sendStatusUpdate = onCall(async (request) => {
       }
     });
 
-    log("DEBUG: FCM tokens found for mobile:", tokens);
+    log("DEBUG: Tokens found for mobile:", tokens);
 
-    if (tokens.length === 0) {
-      log("DEBUG: No FCM tokens found for this user:", mobile);
+    // Split tokens into FCM and APNs tokens
+    const fcmTokens = tokens.filter((t) => !isApnsToken(t));
+    const apnsTokens = tokens.filter(isApnsToken);
+
+    if (fcmTokens.length === 0 && apnsTokens.length === 0) {
+      log("DEBUG: No FCM or APNs tokens found for this user:", mobile);
       return {
         success: false,
-        error: "No FCM tokens found for this user",
+        error: "No FCM or APNs tokens found for this user",
       };
     }
 
-    // Prepare notification payload (no image, no data)
+    // Prepare notification payload (for FCM)
     const payload = {
       notification: {
         title: title,
         body: message,
+        ...(imageUrl && {imageUrl: imageUrl}),
       },
       android: {
         priority: "high",
@@ -355,46 +461,136 @@ export const sendStatusUpdate = onCall(async (request) => {
       },
       apns: {
         payload: {
-          aps: {sound: "default"},
+          aps: {sound: "default", ...(imageUrl && {"mutable-content": 1})},
+          ...(imageUrl && {fcm_options: {image: imageUrl}}),
         },
       },
+      data: data || {},
     };
     log("DEBUG: Notification payload:", payload);
 
-    // Send notifications in batches (FCM limit is 500 tokens per request)
+    // Send FCM notifications in batches (FCM limit is 500 tokens per request)
     const batchSize = 500;
     const results = [];
+    let totalSuccess = 0;
+    let totalFailure = 0;
 
-    for (let i = 0; i < tokens.length; i += batchSize) {
-      const batch = tokens.slice(i, i + batchSize);
+    for (let i = 0; i < fcmTokens.length; i += batchSize) {
+      const batch = fcmTokens.slice(i, i + batchSize);
       try {
         const multicastMessage = {tokens: batch, ...payload};
-        const response =
-        await getMessaging().sendEachForMulticast(multicastMessage);
+        const response = await getMessaging().sendEachForMulticast(
+            multicastMessage,
+        );
         results.push({
           batch: Math.floor(i / batchSize) + 1,
+          type: "FCM",
           successCount: response.successCount,
           failureCount: response.failureCount,
           responses: response.responses,
         });
-        log("DEBUG: Batch sent", {
+        totalSuccess += response.successCount;
+        totalFailure += response.failureCount;
+        log("DEBUG: FCM batch sent", {
           batch: Math.floor(i / batchSize) + 1,
           successCount: response.successCount,
           failureCount: response.failureCount,
         });
       } catch (error) {
-        log("DEBUG: Error sending batch:", error.message, error);
+        log("DEBUG: Error sending FCM batch:", error.message);
         results.push({
           batch: Math.floor(i / batchSize) + 1,
+          type: "FCM",
           error: error.message,
         });
       }
     }
 
-    const totalSuccess = results.reduce((sum, result) =>
-      sum + (result.successCount || 0), 0);
-    const totalFailure = results.reduce((sum, result) =>
-      sum + (result.failureCount || 0), 0);
+    // Send APNs notifications if there are APNs tokens
+    if (apnsTokens.length > 0) {
+      log("DEBUG: Sending APNs notifications", {
+        apnsTokenCount: apnsTokens.length,
+        title,
+        message,
+        imageUrl,
+        data,
+      });
+      // APNs provider setup (replace with your credentials)
+      const apnProvider = new apn.Provider({
+        token: {
+          key: "./AuthKey_G3U784978F.p8",
+          keyId: "G3U784978F",
+          teamId: "PWZNNKGGN3",
+        },
+        production: true,
+      });
+      const apnNotification = new apn.Notification();
+      apnNotification.alert = {title, body: message};
+      apnNotification.sound = "default";
+      apnNotification.topic = "com.ankit.aman.Fixisy";
+      if (imageUrl) {
+        apnNotification.mutableContent = 1;
+        apnNotification.aps = {"mutable-content": 1};
+        apnNotification.payload = {
+          ...(apnNotification.payload || {}),
+          imageUrl,
+        };
+      }
+      if (data) {
+        apnNotification.payload = {
+          ...(apnNotification.payload || {}),
+          ...data,
+        };
+      }
+      // Send APNs notifications in batches (max 1000 per batch is safe)
+      for (let i = 0; i < apnsTokens.length; i += 1000) {
+        const batch = apnsTokens.slice(i, i + 1000);
+        log("DEBUG: Sending APNs batch", {
+          batchNumber: Math.floor(i / 1000) + 1,
+          batchSize: batch.length,
+          notificationPayload: apnNotification,
+        });
+        try {
+          const response = await apnProvider.send(apnNotification, batch);
+          log("DEBUG: APNs batch response", {
+            batchNumber: Math.floor(i / 1000) + 1,
+            sent: response.sent.length,
+            failed: response.failed.length,
+            failedDetails: response.failed,
+          });
+          if (response.failed && response.failed.length > 0) {
+            response.failed.forEach((fail, idx) => {
+              log("APNs failure detail", {
+                batch: Math.floor(i / 1000) + 1,
+                index: idx,
+                device: fail.device,
+                status: fail.status,
+                response: fail.response,
+                error: fail.error,
+                full: JSON.stringify(fail),
+              });
+            });
+          }
+          results.push({
+            batch: Math.floor(i / 1000) + 1,
+            type: "APNs",
+            sent: response.sent.length,
+            failed: response.failed.length,
+            details: response.failed,
+          });
+          totalSuccess += response.sent.length;
+          totalFailure += response.failed.length;
+        } catch (error) {
+          log("DEBUG: Error sending APNs batch:", error.message);
+          results.push({
+            batch: Math.floor(i / 1000) + 1,
+            type: "APNs",
+            error: error.message,
+          });
+        }
+      }
+      apnProvider.shutdown();
+    }
 
     log("DEBUG: Notification sent. Summary:", {
       totalTokens: tokens.length,
@@ -405,7 +601,9 @@ export const sendStatusUpdate = onCall(async (request) => {
 
     return {
       success: true,
-      message: `Notification sent to ${totalSuccess} devices`,
+      message:
+        `Notification sent to ${totalSuccess} devices` +
+        (apnsTokens.length > 0 ? " (includes APNs)" : ""),
       totalTokens: tokens.length,
       totalSuccess,
       totalFailure,
