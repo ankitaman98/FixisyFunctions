@@ -27,8 +27,29 @@ export const createStaffUser = onCall(async (request) => {
       auth: request.auth,
     });
   }
-  const {email, password, name, mobile, permissions, businessId} =
-    request.data;
+
+  // Support both old businessId and new multi-store system
+  const {
+    email,
+    password,
+    name,
+    mobile,
+    permissions,
+    businessId,
+    storeId,
+    assignedStores,
+  } = request.data;
+
+  log("DEBUG: Staff creation data:", {
+    email,
+    name,
+    mobile,
+    permissions,
+    businessId,
+    storeId,
+    assignedStores,
+  });
+
   try {
     // 1. Create Auth user
     const userRecord = await getAuth().createUser({
@@ -36,20 +57,62 @@ export const createStaffUser = onCall(async (request) => {
       password,
       displayName: name,
     });
-    // 2. Add staff profile to Firestore
-    await db.collection("users").doc(userRecord.uid).set({
+
+    // 2. Prepare staff profile data
+    const staffProfile = {
       uid: userRecord.uid,
       email,
       name,
       mobile,
-      permissions,
       role: "staff",
-      businessId,
       createdAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp(),
       active: true,
+    };
+
+    // 3. Handle multi-store assignment
+    if (
+      assignedStores &&
+      Array.isArray(assignedStores) &&
+      assignedStores.length > 0
+    ) {
+      // New multi-store system
+      staffProfile.assignedStores = assignedStores;
+      staffProfile.activeStoreId = assignedStores[0]?.storeId || null;
+      staffProfile.permissions =
+        assignedStores[0]?.permissions || permissions || [];
+
+      log("DEBUG: Using multi-store system:", {
+        assignedStores: staffProfile.assignedStores,
+        activeStoreId: staffProfile.activeStoreId,
+        permissions: staffProfile.permissions,
+      });
+    } else if (businessId) {
+      // Legacy single-store system
+      staffProfile.businessId = businessId;
+      staffProfile.permissions = permissions || [];
+
+      log("DEBUG: Using legacy businessId system:", {
+        businessId: staffProfile.businessId,
+        permissions: staffProfile.permissions,
+      });
+    } else {
+      throw new HttpsError(
+          "invalid-argument",
+          "Either businessId or assignedStores must be provided",
+      );
+    }
+
+    // 4. Add staff profile to Firestore
+    await db.collection("users").doc(userRecord.uid).set(staffProfile);
+
+    log("DEBUG: Staff user created successfully:", {
+      uid: userRecord.uid,
+      email,
+      role: "staff",
     });
-    return {success: true};
+
+    return {success: true, uid: userRecord.uid};
   } catch (error) {
     log("DEBUG: Error in createStaffUser:", error.message);
     throw new HttpsError("internal", error.message, {auth: request.auth});
@@ -65,11 +128,31 @@ export const deleteStaffUser = onCall(async (request) => {
     });
   }
   const {staffUid} = request.data;
+
+  log("DEBUG: Deleting staff user:", staffUid);
+
   try {
-    // 1. Delete Auth user
+    // 1. Get staff profile to log what's being deleted
+    const staffDoc = await db.collection("users").doc(staffUid).get();
+    if (staffDoc.exists) {
+      const staffData = staffDoc.data();
+      log("DEBUG: Staff profile to be deleted:", {
+        uid: staffUid,
+        email: staffData.email,
+        name: staffData.name,
+        role: staffData.role,
+        assignedStores: staffData.assignedStores || [],
+        businessId: staffData.businessId || null,
+      });
+    }
+
+    // 2. Delete Auth user
     await getAuth().deleteUser(staffUid);
-    // 2. Delete Firestore profile
+
+    // 3. Delete Firestore profile
     await db.collection("users").doc(staffUid).delete();
+
+    log("DEBUG: Staff user deleted successfully:", staffUid);
     return {success: true};
   } catch (error) {
     log("DEBUG: Error in deleteStaffUser:", error.message);
@@ -616,6 +699,147 @@ export const sendStatusUpdate = onCall(async (request) => {
       error: error.message || "Failed to send notification",
       details: error.stack,
     };
+  }
+});
+
+export const assignStaffToStore = onCall(async (request) => {
+  log("DEBUG: request.auth:", request.auth);
+  log("DEBUG: request.data:", request.data);
+  if (!request.auth) {
+    throw new HttpsError("unauthenticated", "Request not authenticated", {
+      auth: request.auth,
+    });
+  }
+
+  const {staffUid, storeId, permissions} = request.data;
+
+  log("DEBUG: Assigning staff to store:", {
+    staffUid,
+    storeId,
+    permissions,
+  });
+
+  try {
+    // 1. Get current staff profile
+    const staffRef = db.collection("users").doc(staffUid);
+    const staffDoc = await staffRef.get();
+
+    if (!staffDoc.exists) {
+      throw new HttpsError("not-found", "Staff user not found");
+    }
+
+    const staffData = staffDoc.data();
+
+    // 2. Check if staff is already assigned to this store
+    const currentAssignedStores = staffData.assignedStores || [];
+    const existingAssignment = currentAssignedStores.find(
+        (assignment) => assignment.storeId === storeId,
+    );
+
+    if (existingAssignment) {
+      // Update existing assignment
+      const updatedAssignedStores = currentAssignedStores.map((assignment) =>
+        assignment.storeId === storeId ?
+          {...assignment, permissions, isActive: true} :
+          assignment,
+      );
+
+      await staffRef.update({
+        assignedStores: updatedAssignedStores,
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+
+      log("DEBUG: Updated existing staff assignment:", {
+        staffUid,
+        storeId,
+        permissions,
+      });
+    } else {
+      // Add new assignment
+      const newAssignment = {
+        storeId,
+        permissions,
+        isActive: true,
+      };
+
+      await staffRef.update({
+        assignedStores: FieldValue.arrayUnion(newAssignment),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+
+      log("DEBUG: Added new staff assignment:", {
+        staffUid,
+        storeId,
+        permissions,
+      });
+    }
+
+    return {success: true};
+  } catch (error) {
+    log("DEBUG: Error in assignStaffToStore:", error.message);
+    throw new HttpsError("internal", error.message);
+  }
+});
+
+export const removeStaffFromStore = onCall(async (request) => {
+  log("DEBUG: request.auth:", request.auth);
+  log("DEBUG: request.data:", request.data);
+  if (!request.auth) {
+    throw new HttpsError("unauthenticated", "Request not authenticated", {
+      auth: request.auth,
+    });
+  }
+
+  const {staffUid, storeId} = request.data;
+
+  log("DEBUG: Removing staff from store:", {
+    staffUid,
+    storeId,
+  });
+
+  try {
+    // 1. Get current staff profile
+    const staffRef = db.collection("users").doc(staffUid);
+    const staffDoc = await staffRef.get();
+
+    if (!staffDoc.exists) {
+      throw new HttpsError("not-found", "Staff user not found");
+    }
+
+    const staffData = staffDoc.data();
+    const currentAssignedStores = staffData.assignedStores || [];
+
+    // 2. Remove the store assignment
+    const updatedAssignedStores = currentAssignedStores.filter(
+        (assignment) => assignment.storeId !== storeId,
+    );
+
+    // 3. Update staff profile
+    await staffRef.update({
+      assignedStores: updatedAssignedStores,
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+
+    // 4. If this was the active store, switch to another store
+    if (
+      staffData.activeStoreId === storeId &&
+      updatedAssignedStores.length > 0
+    ) {
+      await staffRef.update({
+        activeStoreId: updatedAssignedStores[0].storeId,
+      });
+    }
+
+    log("DEBUG: Removed staff from store:", {
+      staffUid,
+      storeId,
+      remainingStores: updatedAssignedStores.length,
+    });
+
+    return {success: true};
+  } catch (error) {
+    log("DEBUG: Error in removeStaffFromStore:", error.message);
+    throw new HttpsError("internal", error.message);
   }
 });
 
